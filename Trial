@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SimplyDoors Quote Extractor (Layout Fix)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <script src="https://unpkg.com/pdfjs-dist@2.16.105/build/pdf.min.js"></script>
+    <script>
+        const pdfjsLib = window['pdfjs-dist/build/pdf'];
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@2.16.105/build/pdf.worker.min.js';
+    </script>
+</head>
+<body class="bg-gray-100 min-h-screen p-8">
+    <div class="max-w-7xl mx-auto">
+        
+        <div class="bg-white rounded-lg shadow-md p-6 mb-8 border-l-4 border-blue-600">
+            <h1 class="text-3xl font-bold text-gray-800 mb-2">SimplyDoors Quote Extractor</h1>
+            <p class="text-gray-600 mb-4">
+                <b>New Layout:</b> Item Name is now the header. Description gets full column height to show all details.<br>
+                <b>Logic:</b> Preserves exact diagram crop and text extraction.
+            </p>
+            <input type="file" id="fileInput" accept=".pdf" class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer">
+        </div>
+
+        <div id="loading" class="hidden text-center py-10">
+            <div class="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mb-2"></div>
+            <p class="text-xl text-blue-600 font-bold">Processing PDF...</p>
+        </div>
+
+        <div id="results" class="space-y-8"></div>
+
+    </div>
+
+    <script>
+        const fileInput = document.getElementById('fileInput');
+        const resultsDiv = document.getElementById('results');
+        const loadingDiv = document.getElementById('loading');
+
+        fileInput.addEventListener('change', async function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            resultsDiv.innerHTML = '';
+            loadingDiv.classList.remove('hidden');
+
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const loadingTask = pdfjsLib.getDocument({data: arrayBuffer});
+                const pdf = await loadingTask.promise;
+
+                for (let i = 1; i <= pdf.numPages; i++) {
+                    await processPage(pdf, i);
+                }
+
+            } catch (err) {
+                console.error(err);
+                alert("Error: " + err.message);
+            } finally {
+                loadingDiv.classList.add('hidden');
+            }
+        });
+
+        async function processPage(pdf, pageNum) {
+            const page = await pdf.getPage(pageNum);
+            const scale = 3.0; // High Quality
+            const viewport = page.getViewport({ scale: scale });
+
+            const textContent = await page.getTextContent();
+            let items = textContent.items;
+
+            // Sort: Top-to-Bottom
+            items.sort((a, b) => {
+                const yDiff = b.transform[5] - a.transform[5];
+                if (Math.abs(yDiff) > 5) return yDiff; 
+                return a.transform[4] - b.transform[4];
+            });
+
+            // --- 1. FIND ANCHORS ---
+            let name = "Unknown Item";
+            
+            let pdfY_Top = -1; // "Sales Person"
+            let pdfX_Left = -1; // "Sales Person" X
+            let pdfY_Bot = -1; // "Item Description" Header
+            let pdfX_Qty = -1; // "Qty" Column
+            let pdfY_Total = -1; // "Item Total"
+
+            let commentIndex = -1;
+
+            for (let i = 0; i < items.length; i++) {
+                const str = items[i].str.trim();
+                const y = items[i].transform[5];
+                const x = items[i].transform[4];
+
+                // Name Anchor
+                if (str.includes("Comment:")) {
+                    commentIndex = i;
+                }
+
+                // Diagram Anchors
+                if (str.includes("Sales Person")) {
+                    if (y > pdfY_Top) pdfY_Top = y;
+                    if (pdfX_Left === -1) pdfX_Left = x;
+                }
+                if (str.includes("Item Description")) {
+                    pdfY_Bot = y;
+                }
+                
+                // Description Anchors
+                if (str === "Qty") {
+                    pdfX_Qty = x;
+                }
+                if (str.includes("Item Total") || str.includes("Order Sub Total")) {
+                    if (pdfY_Total === -1) pdfY_Total = y;
+                }
+            }
+
+            // Defaults
+            if (pdfY_Top === -1) pdfY_Top = 700;
+            if (pdfY_Bot === -1) pdfY_Bot = 150;
+            if (pdfX_Left === -1) pdfX_Left = (viewport.width / scale) * 0.35; 
+            if (pdfX_Qty === -1) pdfX_Qty = 550; 
+            if (pdfY_Total === -1) pdfY_Total = 50;
+
+
+            // --- 2. EXTRACT NAME ---
+            if (commentIndex !== -1) {
+                const commentItem = items[commentIndex];
+                const parts = commentItem.str.split("Comment:");
+                
+                if (parts.length > 1 && parts[1].trim().length > 0) {
+                    name = parts[1].trim();
+                } else if (commentIndex + 1 < items.length) {
+                    const nextItem = items[commentIndex + 1];
+                    if (Math.abs(nextItem.transform[5] - commentItem.transform[5]) < 50) {
+                        name = nextItem.str.trim();
+                    }
+                }
+            }
+
+
+            // --- 3. EXTRACT DESCRIPTION ---
+            let descLines = [];
+            const descItems = items.filter(item => {
+                const y = item.transform[5];
+                const x = item.transform[4];
+                return (y < pdfY_Bot - 10 && y > pdfY_Total + 10 && x < pdfX_Qty - 20); 
+            });
+
+            let currentLineY = -1;
+            let currentLineText = [];
+            
+            descItems.forEach(item => {
+                const str = item.str.trim();
+                if (!str) return;
+                
+                const y = item.transform[5];
+                if (Math.abs(y - currentLineY) < 6) {
+                    currentLineText.push(str);
+                } else {
+                    if (currentLineText.length > 0) descLines.push(currentLineText.join(" "));
+                    currentLineY = y;
+                    currentLineText = [str];
+                }
+            });
+            if (currentLineText.length > 0) descLines.push(currentLineText.join(" "));
+            let descText = descLines.join("\n");
+            
+            if (name === "Unknown Item" && descText === "") return;
+
+
+            // --- 4. CROP IMAGE ---
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+
+            const topPt = viewport.convertToViewportPoint(0, pdfY_Top);
+            const cropY = topPt[1] + 30; // 30px Buffer below Sales Person
+
+            const botPt = viewport.convertToViewportPoint(0, pdfY_Bot);
+            const cropBottom = botPt[1] - 35; // 35px Buffer above Item Description
+            const cropHeight = cropBottom - cropY;
+
+            const leftPt = viewport.convertToViewportPoint(pdfX_Left, 0);
+            const cropX = leftPt[0] - 5; 
+
+            const cropWidth = viewport.width - cropX - 20;
+
+            if (cropHeight <= 0 || cropWidth <= 0) return;
+
+            const cropCanvas = document.createElement('canvas');
+            cropCanvas.width = cropWidth;
+            cropCanvas.height = cropHeight;
+            const cropCtx = cropCanvas.getContext('2d');
+
+            cropCtx.fillStyle = '#ffffff';
+            cropCtx.fillRect(0, 0, cropWidth, cropHeight);
+            
+            cropCtx.drawImage(canvas, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+            const imgDataUrl = cropCanvas.toDataURL('image/jpeg', 0.9);
+
+
+            // --- 5. RENDER CARD (NEW LAYOUT) ---
+            const card = `
+            <div class="bg-white rounded-xl shadow-lg overflow-hidden border border-gray-200 flex flex-col">
+                
+                <div class="bg-gray-50 border-b border-gray-200 p-4 flex justify-between items-center">
+                    <div class="flex items-center gap-3">
+                        <span class="bg-blue-100 text-blue-800 text-xs font-bold px-2 py-1 rounded uppercase tracking-wide">Item Name</span>
+                        <h2 class="text-xl font-bold text-gray-900">${name}</h2>
+                    </div>
+                    <button onclick="copyText(this, '${name.replace(/'/g, "\\'")}')" class="text-blue-600 hover:text-blue-800 text-sm font-semibold bg-white border border-blue-200 px-3 py-1 rounded shadow-sm transition-all">Copy Name</button>
+                </div>
+
+                <div class="flex flex-col md:flex-row">
+                    
+                    <div class="w-full md:w-1/2 p-6 border-b md:border-b-0 md:border-r border-gray-200 flex flex-col items-center bg-white">
+                        <div class="w-full flex justify-between mb-2">
+                            <span class="text-gray-400 text-xs font-bold uppercase tracking-wider">Exact Diagram</span>
+                            <span class="text-xs text-gray-300">Right-click > Copy Image</span>
+                        </div>
+                        <div class="w-full flex-grow flex items-center justify-center p-2 border border-dashed border-gray-200 rounded">
+                            <img src="${imgDataUrl}" class="max-w-full max-h-[600px] object-contain">
+                        </div>
+                    </div>
+
+                    <div class="w-full md:w-1/2 p-6 bg-white flex flex-col">
+                        <div class="flex justify-between items-center mb-2">
+                            <span class="text-gray-400 text-xs font-bold uppercase tracking-wider">Full Description</span>
+                            <button onclick="copyText(this, \`${descText.replace(/`/g, "\\`")}\`)" class="text-green-600 hover:text-green-800 text-sm font-semibold bg-green-50 border border-green-200 px-3 py-1 rounded shadow-sm transition-all">Copy Description</button>
+                        </div>
+                        <textarea readonly class="w-full min-h-[500px] bg-gray-50 border border-gray-300 rounded p-4 text-sm font-mono text-gray-800 whitespace-pre leading-relaxed focus:outline-none resize-none">${descText}</textarea>
+                    </div>
+
+                </div>
+            </div>`;
+
+            resultsDiv.insertAdjacentHTML('beforeend', card);
+        }
+
+        function copyText(btn, text) {
+            navigator.clipboard.writeText(text).then(() => {
+                const originalText = btn.innerText;
+                const originalClass = btn.className;
+                btn.innerText = "Copied!";
+                btn.className = "text-white bg-green-600 border border-green-600 px-3 py-1 rounded text-sm font-bold shadow-sm";
+                setTimeout(() => {
+                    btn.innerText = originalText;
+                    btn.className = originalClass;
+                }, 1500);
+            });
+        }
+    </script>
+</body>
+</html>
